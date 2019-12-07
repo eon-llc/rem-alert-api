@@ -11,7 +11,7 @@ import (
 func main() {
 	router := mux.NewRouter().StrictSlash(true)
 
-	router.HandleFunc("/webhook", api.Webhook).Methods("POST")
+	router.HandleFunc("/alerts/webhook", api.Webhook).Methods("POST")
 
 	srv := &http.Server{
 		Handler:      router,
