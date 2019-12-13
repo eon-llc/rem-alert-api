@@ -1,17 +1,32 @@
 package main
 
 import (
-	"./api"
+	"./telegram"
+	"./watchman"
 	"github.com/gorilla/mux"
+	"github.com/jasonlvhit/gocron"
 	"log"
 	"net/http"
 	"time"
 )
 
 func main() {
+	startParser()
+	startServer()
+}
+
+func startParser() {
+	go func() {
+		process := gocron.NewScheduler()
+		process.Every(1).Seconds().Do(watchman.Process)
+		<-process.Start()
+	}()
+}
+
+func startServer() {
 	router := mux.NewRouter().StrictSlash(true)
 
-	router.HandleFunc("/alerts/webhook", api.Webhook).Methods("POST")
+	router.HandleFunc("/alerts/telegram", telegram.Webhook).Methods("POST")
 
 	srv := &http.Server{
 		Handler:      router,
