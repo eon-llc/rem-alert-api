@@ -124,39 +124,50 @@ func getActions(users []db.User) {
 
 	if a.Code == 0 && a.Total.Value > 0 {
 
+		// avoid duplicate notifications
+		// by saving signatures of [user_id + trx_id]
+		notifications := []string{}
+		var lc time.Time
+		var ts time.Time
+		var err error
+
 		for _, user := range users {
 			for _, account := range user.Accounts {
 				for _, action := range a.Actions {
+
+					notification := user.TelegramID + action.TrxID
+
 					// RFC3339 with miliseconds
-					lc, err := time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastCheck)
+					lc, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastCheck)
 					if err != nil {
 						log.Fatal(err)
 					}
 
-					ts, err := time.Parse("2006-01-02T15:04:05.9", action.Timestamp)
+					ts, err = time.Parse("2006-01-02T15:04:05.9", action.Timestamp)
 					if err != nil {
 						log.Fatal(err)
 					}
 
 					within_preference := matchesPreference(user.Settings.Notification, action.Act.Name)
-					after_last_check := ts.After(lc)
+					is_new_tx := (ts.After(lc) && !stringInSlice(notification, notifications))
 					account_match := actorIsInAuth(action.Act.Authorizations, account)
 
-					if account_match && after_last_check && within_preference {
+					if account_match && is_new_tx && within_preference {
 
 						message := ts.Format("Mon Jan _2 15:04 2006 UTC")
 						message += `\n` + "Account *" + account + "* has a new *" + action.Act.Name + "* transaction:"
 						message += `\n\n` + parseData(action.Act.Data, action.Act.Name)
 						message += `\n\n` + "[View on Remme Explorer](https://testchain.remme.io/transaction/" + action.TrxID + ")"
 
-						user.LastCheck = ts.Format("2006-01-02T15:04:05.9Z07:00")
-
-						db.UpdateLastCheck(user.TelegramID, user.LastCheck)
+						notifications = append(notifications, notification)
 						telegram.SendMessage(user, message)
 
 					}
 				}
 			}
+
+			user.LastCheck = ts.Format("2006-01-02T15:04:05.9Z07:00")
+			db.UpdateLastCheck(user.TelegramID, user.LastCheck)
 		}
 	}
 }
