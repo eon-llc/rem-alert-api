@@ -42,10 +42,11 @@ type total struct {
 }
 
 type action struct {
-	Act       act         `json:"act"`
-	Timestamp string      `json:"@timestamp"`
-	BlockNum  json.Number `json:"block_num, Number"`
-	TrxID     string      `json:"trx_id"`
+	Act            act         `json:"act"`
+	Timestamp      string      `json:"@timestamp"`
+	BlockNum       json.Number `json:"block_num, Number"`
+	TrxID          string      `json:"trx_id"`
+	GlobalSequence json.Number `json:"global_sequence, Number"`
 }
 
 type act struct {
@@ -135,7 +136,7 @@ func getActions(users []db.User) {
 			for _, account := range user.Accounts {
 				for _, action := range a.Actions {
 
-					notification := user.TelegramID + action.TrxID
+					notification := user.TelegramID + action.GlobalSequence
 
 					// RFC3339 with miliseconds
 					lc, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastCheck)
