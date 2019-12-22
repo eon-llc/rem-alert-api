@@ -25,12 +25,18 @@ const (
 	remove_account = "remove account"
 	show_accounts  = "show accounts"
 	settings       = "settings"
+	notifications  = "personal alerts"
+	alerts         = "producer alerts"
 	cancel         = "cancel"
 
-	NotifyAll       = "Send me all alerts"
-	NotifyTransfers = "Alert only about token transfers"
-	NotifyChanges   = "Alert only about account changes"
+	NotifyAll       = "Send me all notifications"
+	NotifyTransfers = "Notify only about token transfers"
+	NotifyChanges   = "Notify only about account changes"
 	NotifyStop      = "Stop all notifications"
+
+	AlertAll      = "Alert when any producer fails"
+	AlertPersonal = "Alert only when my producer fails"
+	AlertStop     = "Stop all system alerts"
 )
 
 type response struct {
@@ -140,10 +146,16 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 			chat_id := string(data.Callback.Message.Chat.ID)
 			user, err = db.GetUser(chat_id)
-			user.Settings.Notification = data.Callback.Data
+			setting_type := "notification"
 
-			updateInlineKeyboard(user)
-			answerCallback(string(data.Callback.ID))
+			if strings.Contains(strings.ToLower(data.Callback.Data), "notif") {
+				user.Settings.Notification.Setting = data.Callback.Data
+			} else {
+				user.Settings.Alert.Setting = data.Callback.Data
+				setting_type = "alert"
+			}
+
+			updateInlineKeyboard(user, string(data.Callback.ID), setting_type)
 
 		} else if (data.Message != message{}) {
 
@@ -154,12 +166,16 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 			// must be first interaction
 			// save user to db
 			if err != nil && user.ID == 0 {
+				notification := db.Notification{Setting: NotifyAll}
+				alert := db.Alert{Setting: AlertStop, Snooze: "1970-01-01T00:00:00.000"}
+
 				user.TelegramID = chat_id
 				user.Accounts = []string{}
 				user.Editing = false
 				user.Adding = true
-				user.Settings = db.Settings{Notification: NotifyAll}
+				user.Settings = db.Settings{Notification: notification, Alert: alert}
 				user.LastCheck = time.Now().Format(time.RFC3339)
+				user.LastAlert = user.LastCheck
 				db.InsertUser(user)
 			}
 
@@ -182,6 +198,10 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 					greet(user)
 
+				case cancel:
+
+					mainMenu(user)
+
 				case main_menu:
 
 					mainMenu(user)
@@ -200,7 +220,15 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 				case settings:
 
-					openSettings(user)
+					openSettingsMenu(user)
+
+				case notifications:
+
+					openNotificationSettings(user)
+
+				case alerts:
+
+					openAlertSettings(user)
 
 				default:
 
@@ -327,33 +355,84 @@ func processEditing(user db.User, message string) {
 	sendMessageWithKeyboard(user, text, keyboard, inline)
 }
 
-func openSettings(user db.User) {
-	text := "Please select the level of notification you would like to receive."
+func openSettingsMenu(user db.User) {
+	text := "*Personal alerts* are about your account activity. *Producer alerts* are about producers missing blocks or otherwise underperforming. *Which settings would you like to modify?*"
+	inline := false
+
+	var default_keyboard = [][]Button{
+		[]Button{
+			Button{
+				Text: notifications,
+			},
+			Button{
+				Text: alerts,
+			},
+		},
+		[]Button{
+			Button{
+				Text: cancel,
+			},
+		},
+	}
+
+	sendMessageWithKeyboard(user, text, default_keyboard, inline)
+}
+
+func openNotificationSettings(user db.User) {
+	text := "Please select the level of personal alerts you would like to receive."
 	inline := true
 
 	keyboard := [][]Button{
 		[]Button{
 			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyAll),
+				Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyAll),
 				CallbackData: NotifyAll,
 			},
 		},
 		[]Button{
 			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyTransfers),
+				Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyTransfers),
 				CallbackData: NotifyTransfers,
 			},
 		},
 		[]Button{
 			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyChanges),
+				Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyChanges),
 				CallbackData: NotifyChanges,
 			},
 		},
 		[]Button{
 			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyStop),
+				Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyStop),
 				CallbackData: NotifyStop,
+			},
+		},
+	}
+
+	sendMessageWithKeyboard(user, text, keyboard, inline)
+}
+
+func openAlertSettings(user db.User) {
+	text := "Please select the level of producer alerts you would like to receive."
+	inline := true
+
+	keyboard := [][]Button{
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Alert.Setting, AlertAll),
+				CallbackData: AlertAll,
+			},
+		},
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Alert.Setting, AlertPersonal),
+				CallbackData: AlertPersonal,
+			},
+		},
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Alert.Setting, AlertStop),
+				CallbackData: AlertStop,
 			},
 		},
 	}
@@ -416,42 +495,80 @@ func sendMessageWithKeyboard(user db.User, text string, keyboard [][]Button, inl
 			log.Print(err)
 		}
 
-		user.Settings.MessageID = c.Message.ID
+		if strings.Contains(text, "producer alerts") {
+			user.Settings.Alert.MessageID = c.Message.ID
+		} else {
+			user.Settings.Notification.MessageID = c.Message.ID
+		}
 
 		db.UpdateSettings(user.TelegramID, user.Settings)
 	}
 }
 
-func updateInlineKeyboard(user db.User) {
+func updateInlineKeyboard(user db.User, callback_id string, setting_type string) {
 	url := "https://api.telegram.org/bot" + config[api_key] + "/editMessageReplyMarkup"
 	var errs []error
 	var markup string
+	var message_id string
+	var keyboard [][]Button
+	var notification string
 
-	keyboard := [][]Button{
-		[]Button{
-			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyAll),
-				CallbackData: NotifyAll,
+	if setting_type == "alert" { // producer alert
+		message_id = string(user.Settings.Alert.MessageID)
+		notification = "Updated producer alert settings."
+
+		keyboard = [][]Button{
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Alert.Setting, AlertAll),
+					CallbackData: AlertAll,
+				},
 			},
-		},
-		[]Button{
-			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyTransfers),
-				CallbackData: NotifyTransfers,
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Alert.Setting, AlertPersonal),
+					CallbackData: AlertPersonal,
+				},
 			},
-		},
-		[]Button{
-			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyChanges),
-				CallbackData: NotifyChanges,
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Alert.Setting, AlertStop),
+					CallbackData: AlertStop,
+				},
 			},
-		},
-		[]Button{
-			Button{
-				Text:         markSelectedButton(user.Settings.Notification, NotifyStop),
-				CallbackData: NotifyStop,
+		}
+
+	} else { // personal alert
+
+		message_id = string(user.Settings.Notification.MessageID)
+		notification = "Updated personal alert settings."
+
+		keyboard = [][]Button{
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyAll),
+					CallbackData: NotifyAll,
+				},
 			},
-		},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyTransfers),
+					CallbackData: NotifyTransfers,
+				},
+			},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyChanges),
+					CallbackData: NotifyChanges,
+				},
+			},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Notification.Setting, NotifyStop),
+					CallbackData: NotifyStop,
+				},
+			},
+		}
 	}
 
 	k, err := json.Marshal(keyboard)
@@ -461,7 +578,7 @@ func updateInlineKeyboard(user db.User) {
 
 	markup = `"inline_keyboard": ` + string(k)
 
-	data := `{"chat_id":"` + user.TelegramID + `", "message_id":"` + string(user.Settings.MessageID) + `", "reply_markup": {` + markup + `}}`
+	data := `{"chat_id":"` + user.TelegramID + `", "message_id":"` + message_id + `", "reply_markup": {` + markup + `}}`
 
 	request := gorequest.New()
 	_, _, errs = request.Post(url).Send(data).End()
@@ -471,6 +588,7 @@ func updateInlineKeyboard(user db.User) {
 	}
 
 	db.UpdateSettings(user.TelegramID, user.Settings)
+	answerCallback(callback_id, notification)
 }
 
 func accountExists(name string) bool {
@@ -503,11 +621,11 @@ func accountExists(name string) bool {
 
 }
 
-func answerCallback(callback_query_id string) {
+func answerCallback(callback_query_id string, text string) {
 	url := "https://api.telegram.org/bot" + config[api_key] + "/answerCallbackQuery"
 	var errs []error
 
-	data := `{"callback_query_id":"` + callback_query_id + `"}`
+	data := `{"callback_query_id":"` + callback_query_id + `", "text":"` + text + `"}`
 
 	request := gorequest.New()
 	_, _, errs = request.Post(url).Send(data).End()
