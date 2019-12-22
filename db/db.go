@@ -30,11 +30,23 @@ type User struct {
 	Adding     bool           `json:"adding"`
 	LastCheck  string         `json:"last_check"`
 	Settings   Settings       `json:"settings"`
+	LastAlert  string         `json:"last_alert"`
 }
 
 type Settings struct {
-	Notification string      `json:"notification"`
-	MessageID    json.Number `json:"message_id, Number"`
+	Notification Notification `json:"notification"`
+	Alert        Alert        `json:"alert"`
+}
+
+type Notification struct {
+	Setting   string      `json:"setting"`
+	MessageID json.Number `json:"message_id, Number"`
+}
+
+type Alert struct {
+	Setting   string      `json:"setting"`
+	Snooze    string      `json:"snooze"`
+	MessageID json.Number `json:"message_id, Number"`
 }
 
 func init() {
@@ -65,7 +77,7 @@ func GetUser(telegram_id string) (User, error) {
 
 	row := db.QueryRow(query, telegram_id)
 
-	err := row.Scan(&u.ID, &u.TelegramID, &u.Accounts, &u.Editing, &u.LastCheck, &u.Adding, &u.Settings)
+	err := row.Scan(&u.ID, &u.TelegramID, &u.Accounts, &u.Editing, &u.LastCheck, &u.Adding, &u.Settings, &u.LastAlert)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			log.Print(err)
@@ -75,16 +87,17 @@ func GetUser(telegram_id string) (User, error) {
 	return u, err
 }
 
-func GetActiveUsers(inactive string) ([]User, error) {
+func GetActiveUsers(notify_stop string, alert_stop string) ([]User, error) {
 	users := []User{}
 
 	query := `
         SELECT *
         FROM ` + config[table_name] + `
         WHERE settings->>'notification' != $1
+        OR settings->'alert'->>'setting' != $2
         AND array_length(accounts, 1) > 0;`
 
-	rows, err := db.Query(query, inactive)
+	rows, err := db.Query(query, notify_stop, alert_stop)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -92,7 +105,7 @@ func GetActiveUsers(inactive string) ([]User, error) {
 
 	for rows.Next() {
 		u := User{}
-		err = rows.Scan(&u.ID, &u.TelegramID, &u.Accounts, &u.Editing, &u.LastCheck, &u.Adding, &u.Settings)
+		err = rows.Scan(&u.ID, &u.TelegramID, &u.Accounts, &u.Editing, &u.LastCheck, &u.Adding, &u.Settings, &u.LastAlert)
 		if err != nil {
 			return users, err
 		}
@@ -105,12 +118,12 @@ func GetActiveUsers(inactive string) ([]User, error) {
 
 func InsertUser(u User) {
 	query := `
-        INSERT INTO ` + config[table_name] + ` (telegram_id, editing, adding, accounts, last_check, settings)
-        VALUES ($1, $2, $3, $4, $5, $6)`
+        INSERT INTO ` + config[table_name] + ` (telegram_id, editing, adding, accounts, last_check, settings, last_alert)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	settings, _ := json.Marshal(u.Settings)
 
-	_, err := db.Exec(query, u.TelegramID, u.Editing, u.Adding, u.Accounts, u.LastCheck, settings)
+	_, err := db.Exec(query, u.TelegramID, u.Editing, u.Adding, u.Accounts, u.LastCheck, settings, u.LastAlert)
 	if err != nil {
 		panic(err)
 	}
@@ -156,6 +169,18 @@ func UpdateLastCheck(telegram_id string, timestamp string) {
 	query := `
         UPDATE ` + config[table_name] + `
         SET last_check = $2
+        WHERE telegram_id = $1`
+
+	_, err := db.Exec(query, telegram_id, timestamp)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func UpdateLastAlert(telegram_id string, timestamp string) {
+	query := `
+        UPDATE ` + config[table_name] + `
+        SET last_alert = $2
         WHERE telegram_id = $1`
 
 	_, err := db.Exec(query, telegram_id, timestamp)
