@@ -18,7 +18,7 @@ func main() {
 func startParser() {
 	go func() {
 		process := gocron.NewScheduler()
-		process.Every(1).Seconds().Do(watchman.Process)
+		process.Every(1).Seconds().Do(watchman.Watch)
 		<-process.Start()
 	}()
 }
