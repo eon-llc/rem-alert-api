@@ -17,6 +17,7 @@ const (
 	unlinkauth_s = "unlinkauth"
 	updateauth_s = "updateauth"
 	deleteauth_s = "deleteauth"
+	unregprod_s  = "unregprod"
 )
 
 var notification_actions_to_watch = map[string][]string{
@@ -28,6 +29,7 @@ var notification_actions_to_watch = map[string][]string{
 		unlinkauth_s,
 		updateauth_s,
 		deleteauth_s,
+		unregprod_s,
 	},
 }
 
@@ -227,8 +229,13 @@ func sendNotifications(users []db.User) {
 						}
 
 						message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
-						message += `\n` + "Account *" + account + "* has a new *" + action_name + "* transaction:"
-						message += `\n\n` + parseData(action.Act.Data, action.Act.Name)
+						message += `\n` + "Account *" + account + "* has a new *" + action_name + "* transaction."
+
+						message_body := parseData(action.Act.Data, action.Act.Name)
+						if len(message_body) > 0 {
+							message += `\n\n` + message_body
+						}
+
 						message += `\n\n` + "[View on Remme Explorer](https://remchain.remme.io/transaction/" + action.TrxID + ")"
 
 						notifications = append(notifications, notification)
@@ -413,8 +420,12 @@ func sendAlerts(users []db.User) {
 				}
 
 				// send messages for every type of failure
+				has_missed_blocks := len(missed_blocks.Producers) > 0
+				has_missed_init := len(filtered_missed_init.Producers) > 0
+				has_missed_setprice := len(filtered_missed_setprice.Producers) > 0
+
 				// missed blocks
-				if len(missed_blocks.Producers) > 0 {
+				if has_missed_blocks {
 					block_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
 					block_message += `\n` + "The following block producers are missing blocks:"
 
@@ -438,7 +449,7 @@ func sendAlerts(users []db.User) {
 				}
 
 				// missed init
-				if len(filtered_missed_init.Producers) > 0 {
+				if has_missed_init {
 					init_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
 					init_message += `\n` + "The following block producers are missing `init` action, from last 12 hours:"
 
@@ -450,7 +461,7 @@ func sendAlerts(users []db.User) {
 				}
 
 				// missed setprice
-				if len(filtered_missed_setprice.Producers) > 0 {
+				if has_missed_setprice {
 					setprice_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
 					setprice_message += `\n` + "The following block producers are missing `setprice` action, from last 2 hours:"
 
@@ -461,8 +472,10 @@ func sendAlerts(users []db.User) {
 					telegram.SendMessage(user, setprice_message)
 				}
 
-				user.LastAlert = time.Now().Format("2006-01-02T15:04:05.9Z07:00")
-				db.UpdateLastAlert(user.TelegramID, user.LastAlert)
+				if has_missed_blocks || has_missed_init || has_missed_setprice {
+					user.LastAlert = time.Now().Format("2006-01-02T15:04:05.9Z07:00")
+					db.UpdateLastAlert(user.TelegramID, user.LastAlert)
+				}
 			}
 		}
 	}
@@ -702,9 +715,9 @@ func parseData(data map[string]interface{}, action_name string) string {
 	var output string
 	var err error
 
-	if stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyTransfers]) {
+	jsonString, _ := json.Marshal(data)
 
-		jsonString, _ := json.Marshal(data)
+	if stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyTransfers]) {
 
 		t := transfer{}
 
@@ -720,8 +733,6 @@ func parseData(data map[string]interface{}, action_name string) string {
 	} else if stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyChanges]) {
 		if action_name == linkauth_s || action_name == unlinkauth_s {
 
-			jsonString, _ := json.Marshal(data)
-
 			l := linkauth{}
 
 			err = json.Unmarshal(jsonString, &l)
@@ -736,8 +747,6 @@ func parseData(data map[string]interface{}, action_name string) string {
 
 		} else if action_name == updateauth_s || action_name == deleteauth_s {
 
-			jsonString, _ := json.Marshal(data)
-
 			u := updateauth{}
 
 			err = json.Unmarshal(jsonString, &u)
@@ -747,6 +756,10 @@ func parseData(data map[string]interface{}, action_name string) string {
 
 			output = "Permission: *" + u.Permission + "*"
 			output += `\n` + "Parent: *" + u.Parent + "*"
+
+		} else if action_name == unregprod_s {
+
+			output = ""
 
 		}
 	}
