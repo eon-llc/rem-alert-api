@@ -19,7 +19,7 @@ const (
 	deleteauth_s = "deleteauth"
 )
 
-var actions_to_watch = map[string][]string{
+var notification_actions_to_watch = map[string][]string{
 	telegram.NotifyTransfers: []string{
 		transfer_s,
 	},
@@ -29,6 +29,10 @@ var actions_to_watch = map[string][]string{
 		updateauth_s,
 		deleteauth_s,
 	},
+}
+
+var alert_actions_to_watch = []string{
+	"init", "setprice",
 }
 
 type actions struct {
@@ -121,26 +125,54 @@ type producer struct {
 	PunishedUntil                    string `json:"punished_until"`
 }
 
+type voters struct {
+	Voters []voter `json:"rows"`
+}
+
+type voter struct {
+	Owner               string      `json:"owner"`
+	Producers           []string    `json:"producers"`
+	Staked              json.Number `json:"staked, Number"`
+	LastReassertionTime string      `json:"last_reassertion_time"`
+}
+
+type swaps struct {
+	Swaps []swap `json:"rows"`
+}
+
+// status:
+// 0 initiated, 1 issued (approved), 2 finished (user got the tokens), -1 canceled
+type swap struct {
+	Key               int      `json:"key"`
+	SwapTimestamp     string   `json:"swap_timestamp"`
+	Status            int      `json:"status"`
+	ProvidedApprovals []string `json:"provided_approvals"`
+}
+
 func Watch() {
 	var users []db.User
 	var err error
 
-	users, err = db.GetActiveUsers(telegram.NotifyStop, telegram.AlertStop)
+	users, err = db.GetActiveUsers(telegram.NotifyStop, telegram.AlertStop, telegram.RemindStop)
 
 	if err != nil {
 		log.Print(err)
 	}
 
-	//sendNotifications(users)
+	sendNotifications(users)
 	sendAlerts(users)
+	sendReminders(users)
 }
 
 func sendNotifications(users []db.User) {
 	today := time.Now()
 	epoch := time.Second * -30
 	epoch_ago := today.Add(epoch)
+	limit := "15000"
+	action_names := strings.Join(flatten(notification_actions_to_watch), ",")
+	account := ""
 
-	a := getActions(epoch_ago)
+	a := getActions(epoch_ago, action_names, limit, account)
 	scheduled_txs := getScheduledTxs(epoch_ago)
 
 	for _, tx := range scheduled_txs.Transactions {
@@ -164,16 +196,17 @@ func sendNotifications(users []db.User) {
 		var err error
 
 		for _, user := range users {
+
+			// RFC3339 with miliseconds
+			lc, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastCheck)
+			if err != nil {
+				log.Print(err)
+			}
+
 			for _, account := range user.Accounts {
 				for _, action := range a.Actions {
 
 					notification := user.TelegramID + string(action.GlobalSequence)
-
-					// RFC3339 with miliseconds
-					lc, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastCheck)
-					if err != nil {
-						log.Print(err)
-					}
 
 					ts, err = time.Parse("2006-01-02T15:04:05.9", action.Timestamp)
 					if err != nil {
@@ -193,7 +226,7 @@ func sendNotifications(users []db.User) {
 							action_name = action.Act.Name
 						}
 
-						message := time.Now().Format("Mon Jan _2 15:04 2006 UTC")
+						message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
 						message += `\n` + "Account *" + account + "* has a new *" + action_name + "* transaction:"
 						message += `\n\n` + parseData(action.Act.Data, action.Act.Name)
 						message += `\n\n` + "[View on Remme Explorer](https://remchain.remme.io/transaction/" + action.TrxID + ")"
@@ -214,16 +247,101 @@ func sendNotifications(users []db.User) {
 func sendAlerts(users []db.User) {
 	var last_block_time time.Time
 	var last_alert time.Time
+	var top_21_chosen_time time.Time
 	var snooze time.Time
+	var bp_chosen_time time.Time
+	var most_recent_swap time.Time
 	var err error
 
 	p := getProducers()
+	s := getSwaps()
+
+	for _, swap := range s.Swaps {
+		var ts time.Time
+
+		ts, err = time.Parse("2006-01-02T15:04:05.9", swap.SwapTimestamp)
+		if err != nil {
+			log.Print(err)
+		}
+
+		if ts.After(most_recent_swap) {
+			most_recent_swap = ts
+		}
+	}
+
+	all_producers := []string{}
+	missed_init := producers{}
+	missed_setprice := producers{}
+
+	today := time.Now()
+	actions_cutoff := today.Add(time.Hour * -12)
+	limit := "15000"
+	action_names := strings.Join(alert_actions_to_watch, ",")
+
+	for _, producer := range p.Producers {
+		if !stringInSlice(producer.Owner, all_producers) {
+			all_producers = append(all_producers, producer.Owner)
+		}
+	}
+
+	all_producers_s := strings.Join(all_producers, ",")
+	a := getActions(actions_cutoff, action_names, limit, all_producers_s)
+	negative_two_hours := time.Hour * -2
+	two_hours_ago := today.Add(negative_two_hours)
+
+	for _, producer := range p.Producers {
+
+		bp_chosen_time, err = time.Parse("2006-01-02T15:04:05.9", producer.Top21ChosenTime)
+		if err != nil {
+			log.Print(err)
+		}
+
+		found_init := false
+		found_setprice := false
+
+		for _, action := range a.Actions {
+			var ts time.Time
+			account_match := actorIsInAuth(action.Act.Authorizations, producer.Owner)
+
+			if account_match {
+
+				ts, err = time.Parse("2006-01-02T15:04:05.9", action.Timestamp)
+				if err != nil {
+					log.Print(err)
+				}
+
+				// setprice occurs most frequently
+				// check by timestamp within the last 2 hours
+				if action.Act.Name == "setprice" && action.Act.Account == "rem.oracle" && ts.After(two_hours_ago) {
+					found_setprice = true
+				}
+
+				// check if most recent swap happened after this bp was chosen
+				// and after our actions_cutoff duration
+				if most_recent_swap.After(actions_cutoff) && most_recent_swap.After(bp_chosen_time) {
+					// check if init action happened after most recent swap
+					if action.Act.Name == "init" && action.Act.Account == "rem.swap" && ts.After(most_recent_swap) {
+						found_init = true
+					}
+				} else {
+					found_init = true
+				}
+
+			}
+		}
+
+		if !found_init {
+			missed_init.Producers = append(missed_init.Producers, producer)
+		}
+
+		if !found_setprice {
+			missed_setprice.Producers = append(missed_setprice.Producers, producer)
+		}
+	}
 
 	for _, user := range users {
 
 		if user.Settings.Alert.Setting != "Stop all system alerts" {
-
-			filtered := producers{}
 
 			last_alert, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastAlert)
 			if err != nil {
@@ -235,27 +353,51 @@ func sendAlerts(users []db.User) {
 				log.Print(err)
 			}
 
-			if user.Settings.Alert.Setting == "Alert only when my producer fails" {
-				for _, producer := range p.Producers {
-					if stringInSlice(producer.Owner, user.Accounts) {
-						filtered.Producers = append(filtered.Producers, producer)
-					}
-				}
-			} else if user.Settings.Alert.Setting == "Alert when any producer fails" {
-				filtered = p
-			}
-
-			// do not alert more often than every 5 minutes
-			five_mins_since_last_alert := time.Now().After(last_alert.Add(time.Minute * 5))
+			// do not alert more often than every 60 minutes
+			time_for_new_alert := time.Now().After(last_alert.Add(time.Minute * 60))
 			not_snoozing := time.Now().After(snooze)
 
-			if five_mins_since_last_alert && not_snoozing {
+			if time_for_new_alert && not_snoozing {
 
-				bad := producers{}
+				missed_blocks := producers{}
+				filtered_producers := producers{}
+				filtered_missed_init := producers{}
+				filtered_missed_setprice := producers{}
 
-				for _, producer := range filtered.Producers {
+				if user.Settings.Alert.Setting == "Alert only when my producer fails" {
+
+					for _, producer := range p.Producers {
+						if stringInSlice(producer.Owner, user.Accounts) {
+							filtered_producers.Producers = append(filtered_producers.Producers, producer)
+						}
+					}
+
+					for _, producer := range missed_init.Producers {
+						if stringInSlice(producer.Owner, user.Accounts) {
+							filtered_missed_init.Producers = append(filtered_missed_init.Producers, producer)
+						}
+					}
+
+					for _, producer := range missed_setprice.Producers {
+						if stringInSlice(producer.Owner, user.Accounts) {
+							filtered_missed_setprice.Producers = append(filtered_missed_setprice.Producers, producer)
+						}
+					}
+
+				} else if user.Settings.Alert.Setting == "Alert when any producer fails" {
+					filtered_producers = p
+					filtered_missed_init = missed_init
+					filtered_missed_setprice = missed_setprice
+				}
+
+				for _, producer := range filtered_producers.Producers {
 
 					last_block_time, err = time.Parse("2006-01-02T15:04:05.9", producer.LastBlockTime)
+					if err != nil {
+						log.Print(err)
+					}
+
+					top_21_chosen_time, err = time.Parse("2006-01-02T15:04:05.9", producer.Top21ChosenTime)
 					if err != nil {
 						log.Print(err)
 					}
@@ -263,24 +405,60 @@ func sendAlerts(users []db.User) {
 					// one cycle is 126 seconds (21 producers for 6 seconds each)
 					// allow two cycles missed in a row before sending an alert
 					producer_missed_blocks := time.Since(last_block_time).Seconds() > 252
+					chosen_long_enough := time.Since(top_21_chosen_time).Seconds() > 252
 
-					if producer_missed_blocks {
-						log.Print(time.Since(last_block_time).Seconds(), " - ", producer.Owner, user.TelegramID)
-						bad.Producers = append(bad.Producers, producer)
+					if producer_missed_blocks && chosen_long_enough {
+						missed_blocks.Producers = append(missed_blocks.Producers, producer)
 					}
 				}
 
-				if len(bad.Producers) > 0 {
-					message := time.Now().Format("Mon Jan _2 15:04 2006 UTC")
-					message += `\n` + "The following block producers are currently missing blocks:"
+				// send messages for every type of failure
+				// missed blocks
+				if len(missed_blocks.Producers) > 0 {
+					block_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
+					block_message += `\n` + "The following block producers are missing blocks:"
 
-					for _, bp := range bad.Producers {
+					for _, bp := range missed_blocks.Producers {
+						last_block_time, err = time.Parse("2006-01-02T15:04:05.9", bp.LastBlockTime)
+						if err != nil {
+							log.Print(err)
+						}
+
 						seconds_since_last := int(time.Since(last_block_time).Seconds())
 						missed_blocks := strconv.Itoa(int(seconds_since_last / 120))
-						message += "*" + bp.Owner + "* produced " + strconv.Itoa(seconds_since_last) + " seconds ago (missed " + missed_blocks + " blocks)."
+
+						if bp.LastBlockTime == "1970-01-01T00:00:00.000" {
+							block_message += `\n` + "*" + bp.Owner + "* has not produced any blocks yet."
+						} else {
+							block_message += `\n` + "*" + bp.Owner + "* produced " + strconv.Itoa(seconds_since_last) + " seconds ago (missed " + missed_blocks + " blocks)."
+						}
 					}
 
-					telegram.SendMessage(user, message)
+					telegram.SendMessage(user, block_message)
+				}
+
+				// missed init
+				if len(filtered_missed_init.Producers) > 0 {
+					init_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
+					init_message += `\n` + "The following block producers are missing `init` action, from last 12 hours:"
+
+					for _, bp := range filtered_missed_init.Producers {
+						init_message += `\n` + "*" + bp.Owner + "*"
+					}
+
+					telegram.SendMessage(user, init_message)
+				}
+
+				// missed setprice
+				if len(filtered_missed_setprice.Producers) > 0 {
+					setprice_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
+					setprice_message += `\n` + "The following block producers are missing `setprice` action, from last 2 hours:"
+
+					for _, bp := range filtered_missed_setprice.Producers {
+						setprice_message += `\n` + "*" + bp.Owner + "*"
+					}
+
+					telegram.SendMessage(user, setprice_message)
 				}
 
 				user.LastAlert = time.Now().Format("2006-01-02T15:04:05.9Z07:00")
@@ -290,14 +468,70 @@ func sendAlerts(users []db.User) {
 	}
 }
 
-func getActions(epoch_ago time.Time) actions {
+func sendReminders(users []db.User) {
+	var lr time.Time
+	var err error
+
+	v := getVoters()
+
+	for _, user := range users {
+		// RFC3339 with miliseconds
+		lr, err = time.Parse("2006-01-02T15:04:05.9Z07:00", user.LastReminder)
+		if err != nil {
+			log.Print(err)
+		}
+
+		if user.Settings.Reminder.Setting != "Stop all reminders" {
+			for _, voter := range v.Voters {
+				if stringInSlice(voter.Owner, user.Accounts) {
+					var last_vote time.Time
+
+					last_vote, err = time.Parse("2006-01-02T15:04:05.9", voter.LastReassertionTime)
+					if err != nil {
+						log.Print(err)
+					}
+
+					days_since_vote := time.Since(last_vote).Hours() / 24
+					days_since_vote_s := strconv.Itoa(int(days_since_vote))
+					wants_weekly_reminder := strings.Contains(strings.ToLower(user.Settings.Reminder.Setting), "weekly")
+					wants_monthly_reminder := strings.Contains(strings.ToLower(user.Settings.Reminder.Setting), "monthly")
+					time_for_weekly := wants_weekly_reminder && days_since_vote >= 7
+					time_for_monthly := wants_monthly_reminder && days_since_vote >= 30
+					time_for_reminder := time.Since(lr).Hours() > 24
+
+					if time_for_reminder && (time_for_weekly || time_for_monthly) {
+
+						message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
+
+						if time_for_monthly {
+							message += `\n` + "Account *" + voter.Owner + "* needs to vote or it will lose guardian status."
+						} else if time_for_weekly {
+							message += `\n` + "Account *" + voter.Owner + "* should vote again; " + days_since_vote_s + " days since last vote."
+						}
+
+						telegram.SendMessage(user, message)
+
+						user.LastReminder = time.Now().Format("2006-01-02T15:04:05.9Z07:00")
+						db.UpdateLastReminder(user.TelegramID, user.LastReminder)
+					}
+				}
+			}
+		}
+	}
+}
+
+func getActions(epoch_ago time.Time, action_names string, limit string, account string) actions {
 	var body string
 	var err error
 	// convert timestamp to ISO8601 for Hyperion
 	after := epoch_ago.Format("2006-01-02T15:04:05")
-	action_names := strings.Join(flatten(actions_to_watch), ",")
 
-	url := "https://rem.eon.llc/v2/history/get_actions?act.name=" + action_names + "&limit=15000&sort=asc&after=" + after
+	// account is optional
+	if len(account) > 0 {
+		account = "act.authorization.actor=" + account + "&"
+	}
+
+	url := "https://rem.eon.llc/v2/history/get_actions?" + account + "act.name=" + action_names + "&limit=" + limit + "&sort=asc&after=" + after
 
 	request := gorequest.New()
 	_, body, errs := request.Get(url).End()
@@ -341,12 +575,81 @@ func getProducers() producers {
 	// those who have never produced a block
 	// are of no concern, remove them
 	for _, producer := range all.Producers {
-		if producer.IsActive == 1 && producer.LastBlockTime != "1970-01-01T00:00:00.000" && producer.Top21ChosenTime != "1970-01-01T00:00:00.000" {
+		if producer.IsActive == 1 && producer.Top21ChosenTime != "1970-01-01T00:00:00.000" {
 			relevant.Producers = append(relevant.Producers, producer)
 		}
 	}
 
 	return relevant
+}
+
+func getVoters() voters {
+	var body string
+	var err error
+	var staked uint64
+
+	url := "http://rem.eon.llc/v1/chain/get_table_rows"
+	data := `{"table":"voters","scope":"rem","code":"rem","limit": 1000,"json":true}`
+
+	request := gorequest.New()
+	_, body, errs := request.Post(url).Send(data).End()
+
+	if errs != nil {
+		log.Print(errs)
+	}
+
+	all := voters{}
+	active := voters{}
+
+	err = json.Unmarshal([]byte(body), &all)
+	if err != nil {
+		log.Print(err)
+	}
+
+	// those who have never produced a block
+	// are of no concern, remove them
+	for _, voter := range all.Voters {
+		staked, _ = strconv.ParseUint(string(voter.Staked), 10, 64)
+
+		if len(voter.Producers) > 0 && staked >= 2500000000 {
+			active.Voters = append(active.Voters, voter)
+		}
+	}
+
+	return active
+}
+
+func getSwaps() swaps {
+	var body string
+	var err error
+
+	url := "http://rem.eon.llc/v1/chain/get_table_rows"
+	data := `{"table":"swaps","scope":"rem.swap","code":"rem.swap","reverse":true,"limit":10,"json":true}`
+
+	request := gorequest.New()
+	_, body, errs := request.Post(url).Send(data).End()
+
+	if errs != nil {
+		log.Print(errs)
+	}
+
+	all := swaps{}
+	valid := swaps{}
+
+	err = json.Unmarshal([]byte(body), &all)
+	if err != nil {
+		log.Print(err)
+	}
+
+	// those who have never produced a block
+	// are of no concern, remove them
+	for _, swap := range all.Swaps {
+		if len(swap.ProvidedApprovals) > 3 {
+			valid.Swaps = append(valid.Swaps, swap)
+		}
+	}
+
+	return valid
 }
 
 func getScheduledTxs(epoch_ago time.Time) transactions {
@@ -386,9 +689,9 @@ func actorIsInAuth(authorizations []authorization, actor string) bool {
 func matchesPreference(preference string, action_name string) bool {
 	if preference == telegram.NotifyAll {
 		return true
-	} else if preference == telegram.NotifyTransfers && stringInSlice(action_name, actions_to_watch[telegram.NotifyTransfers]) {
+	} else if preference == telegram.NotifyTransfers && stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyTransfers]) {
 		return true
-	} else if preference == telegram.NotifyChanges && stringInSlice(action_name, actions_to_watch[telegram.NotifyChanges]) {
+	} else if preference == telegram.NotifyChanges && stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyChanges]) {
 		return true
 	}
 
@@ -399,7 +702,7 @@ func parseData(data map[string]interface{}, action_name string) string {
 	var output string
 	var err error
 
-	if stringInSlice(action_name, actions_to_watch[telegram.NotifyTransfers]) {
+	if stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyTransfers]) {
 
 		jsonString, _ := json.Marshal(data)
 
@@ -414,7 +717,7 @@ func parseData(data map[string]interface{}, action_name string) string {
 		output += `\n` + "To: *" + t.To + "*"
 		output += `\n` + "Quantity: *" + t.Quantity + "*"
 
-	} else if stringInSlice(action_name, actions_to_watch[telegram.NotifyChanges]) {
+	} else if stringInSlice(action_name, notification_actions_to_watch[telegram.NotifyChanges]) {
 		if action_name == linkauth_s || action_name == unlinkauth_s {
 
 			jsonString, _ := json.Marshal(data)

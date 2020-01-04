@@ -25,9 +25,10 @@ const (
 	remove_account = "remove account"
 	show_accounts  = "show accounts"
 	settings       = "settings"
-	notifications  = "personal alerts"
+	notifications  = "account alerts"
 	alerts         = "producer alerts"
-	cancel         = "cancel"
+	reminders      = "guardian alerts"
+	cancel         = "back"
 
 	NotifyAll       = "Send me all notifications"
 	NotifyTransfers = "Notify only about token transfers"
@@ -37,6 +38,11 @@ const (
 	AlertAll      = "Alert when any producer fails"
 	AlertPersonal = "Alert only when my producer fails"
 	AlertStop     = "Stop all system alerts"
+
+	RemindAll     = "Remind me to vote weekly and monthly"
+	RemindWeekly  = "Remind me only to vote weekly"
+	RemindMonthly = "Remind me only to vote monthly"
+	RemindStop    = "Stop all reminders"
 )
 
 type response struct {
@@ -150,6 +156,9 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 			if strings.Contains(strings.ToLower(data.Callback.Data), "notif") {
 				user.Settings.Notification.Setting = data.Callback.Data
+			} else if strings.Contains(strings.ToLower(data.Callback.Data), "remind") {
+				user.Settings.Reminder.Setting = data.Callback.Data
+				setting_type = "reminder"
 			} else {
 				user.Settings.Alert.Setting = data.Callback.Data
 				setting_type = "alert"
@@ -165,23 +174,26 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 			// must be first interaction
 			// save user to db
-			if err != nil && user.ID == 0 {
+
+			if err != nil && err.Error() == "sql: no rows in result set" && user.ID == 0 {
 				notification := db.Notification{Setting: NotifyAll}
 				alert := db.Alert{Setting: AlertStop, Snooze: "1970-01-01T00:00:00.000"}
+				reminder := db.Reminder{Setting: RemindStop}
 
 				user.TelegramID = chat_id
 				user.Accounts = []string{}
 				user.Editing = false
 				user.Adding = true
-				user.Settings = db.Settings{Notification: notification, Alert: alert}
+				user.Settings = db.Settings{Notification: notification, Alert: alert, Reminder: reminder}
 				user.LastCheck = time.Now().Format(time.RFC3339)
 				user.LastAlert = user.LastCheck
+				user.LastReminder = user.LastCheck
 				db.InsertUser(user)
 			}
 
 			if user.Editing { // bot expects an answer till cancelation is called
 
-				if message == "cancel" {
+				if message == cancel {
 
 					cancelEditing(user)
 
@@ -229,6 +241,10 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 				case alerts:
 
 					openAlertSettings(user)
+
+				case reminders:
+
+					openReminderSettings(user)
 
 				default:
 
@@ -324,8 +340,8 @@ func processEditing(user db.User, message string) {
 	keyboard := cancel_keyboard
 	inline := false
 
-	if len(message) != 12 {
-		text = "Invalid account name. REM account names are 12 characters long."
+	if len(message) < 1 && len(message) > 13 {
+		text = "Invalid account name. REM account names are between 1 and 12 characters long."
 	} else {
 
 		switch adding := user.Adding; adding {
@@ -356,7 +372,7 @@ func processEditing(user db.User, message string) {
 }
 
 func openSettingsMenu(user db.User) {
-	text := "*Personal alerts* are about your account activity. *Producer alerts* are about producers missing blocks or otherwise underperforming. *Which settings would you like to modify?*"
+	text := "Which settings would you like to modify? Guardian and Producer alerts are disabled by default."
 	inline := false
 
 	var default_keyboard = [][]Button{
@@ -364,6 +380,13 @@ func openSettingsMenu(user db.User) {
 			Button{
 				Text: notifications,
 			},
+		},
+		[]Button{
+			Button{
+				Text: reminders,
+			},
+		},
+		[]Button{
 			Button{
 				Text: alerts,
 			},
@@ -379,7 +402,7 @@ func openSettingsMenu(user db.User) {
 }
 
 func openNotificationSettings(user db.User) {
-	text := "Please select the level of personal alerts you would like to receive."
+	text := "Please select the level of account alerts you would like to receive."
 	inline := true
 
 	keyboard := [][]Button{
@@ -433,6 +456,40 @@ func openAlertSettings(user db.User) {
 			Button{
 				Text:         markSelectedButton(user.Settings.Alert.Setting, AlertStop),
 				CallbackData: AlertStop,
+			},
+		},
+	}
+
+	sendMessageWithKeyboard(user, text, keyboard, inline)
+}
+
+func openReminderSettings(user db.User) {
+	text := "Please select the level of guardian alerts you would like to receive."
+	inline := true
+
+	keyboard := [][]Button{
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindAll),
+				CallbackData: RemindAll,
+			},
+		},
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindWeekly),
+				CallbackData: RemindWeekly,
+			},
+		},
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindMonthly),
+				CallbackData: RemindMonthly,
+			},
+		},
+		[]Button{
+			Button{
+				Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindStop),
+				CallbackData: RemindStop,
 			},
 		},
 	}
@@ -497,6 +554,8 @@ func sendMessageWithKeyboard(user db.User, text string, keyboard [][]Button, inl
 
 		if strings.Contains(text, "producer alerts") {
 			user.Settings.Alert.MessageID = c.Message.ID
+		} else if strings.Contains(text, "guard") {
+			user.Settings.Reminder.MessageID = c.Message.ID
 		} else {
 			user.Settings.Notification.MessageID = c.Message.ID
 		}
@@ -514,6 +573,7 @@ func updateInlineKeyboard(user db.User, callback_id string, setting_type string)
 	var notification string
 
 	if setting_type == "alert" { // producer alert
+
 		message_id = string(user.Settings.Alert.MessageID)
 		notification = "Updated producer alert settings."
 
@@ -537,11 +597,42 @@ func updateInlineKeyboard(user db.User, callback_id string, setting_type string)
 				},
 			},
 		}
+	} else if setting_type == "reminder" { // guardian reminder
 
-	} else { // personal alert
+		message_id = string(user.Settings.Reminder.MessageID)
+		notification = "Updated guardian alert settings."
+
+		keyboard = [][]Button{
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindAll),
+					CallbackData: RemindAll,
+				},
+			},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindWeekly),
+					CallbackData: RemindWeekly,
+				},
+			},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindMonthly),
+					CallbackData: RemindMonthly,
+				},
+			},
+			[]Button{
+				Button{
+					Text:         markSelectedButton(user.Settings.Reminder.Setting, RemindStop),
+					CallbackData: RemindStop,
+				},
+			},
+		}
+
+	} else { // account notification
 
 		message_id = string(user.Settings.Notification.MessageID)
-		notification = "Updated personal alert settings."
+		notification = "Updated account alert settings."
 
 		keyboard = [][]Button{
 			[]Button{
