@@ -240,7 +240,6 @@ func sendNotifications(users []db.User) {
 
 						notifications = append(notifications, notification)
 						telegram.SendMessage(user, message)
-
 					}
 				}
 			}
@@ -257,11 +256,20 @@ func sendAlerts(users []db.User) {
 	var top_21_chosen_time time.Time
 	var snooze time.Time
 	var bp_chosen_time time.Time
-	var most_recent_swap time.Time
+	var most_recent_init time.Time
 	var err error
 
 	p := getProducers()
 	s := getSwaps()
+
+	today := time.Now()
+
+	// init is the swap action name
+	init_exists := false
+	// give new init some time to propagate
+	// otherwise we think BPs missed an init
+	// that they haven't had a chance to see yet
+	ten_minutes_ago := today.Add(time.Minute * -10)
 
 	for _, swap := range s.Swaps {
 		var ts time.Time
@@ -271,8 +279,9 @@ func sendAlerts(users []db.User) {
 			log.Print(err)
 		}
 
-		if ts.After(most_recent_swap) {
-			most_recent_swap = ts
+		if ts.After(most_recent_init) && ts.Before(ten_minutes_ago) {
+			init_exists = true
+			most_recent_init = ts
 		}
 	}
 
@@ -280,7 +289,6 @@ func sendAlerts(users []db.User) {
 	missed_init := producers{}
 	missed_setprice := producers{}
 
-	today := time.Now()
 	actions_cutoff := today.Add(time.Hour * -12)
 	limit := "15000"
 	action_names := strings.Join(alert_actions_to_watch, ",")
@@ -296,53 +304,65 @@ func sendAlerts(users []db.User) {
 	negative_two_hours := time.Hour * -2
 	two_hours_ago := today.Add(negative_two_hours)
 
-	for _, producer := range p.Producers {
+	// parse actions, if there are any
+	// to send out init and setprice alerts
+	if len(a.Actions) > 0 {
+		for _, producer := range p.Producers {
 
-		bp_chosen_time, err = time.Parse("2006-01-02T15:04:05.9", producer.Top21ChosenTime)
-		if err != nil {
-			log.Print(err)
-		}
+			bp_chosen_time, err = time.Parse("2006-01-02T15:04:05.9", producer.Top21ChosenTime)
+			if err != nil {
+				log.Print(err)
+			}
 
-		found_init := false
-		found_setprice := false
+			found_init := false
+			found_setprice := false
+			setprice_exists := false
 
-		for _, action := range a.Actions {
-			var ts time.Time
-			account_match := actorIsInAuth(action.Act.Authorizations, producer.Owner)
-
-			if account_match {
+			for _, action := range a.Actions {
+				var ts time.Time
 
 				ts, err = time.Parse("2006-01-02T15:04:05.9", action.Timestamp)
 				if err != nil {
 					log.Print(err)
 				}
 
-				// setprice occurs most frequently
-				// check by timestamp within the last 2 hours
+				// make sure that our data actually contains a setprice action
+				// before we hold producers accountable for missing it
 				if action.Act.Name == "setprice" && action.Act.Account == "rem.oracle" && ts.After(two_hours_ago) {
-					found_setprice = true
+					setprice_exists = true
 				}
 
-				// check if most recent swap happened after this bp was chosen
-				// and after our actions_cutoff duration
-				if most_recent_swap.After(actions_cutoff) && most_recent_swap.After(bp_chosen_time) {
-					// check if init action happened after most recent swap
-					if action.Act.Name == "init" && action.Act.Account == "rem.swap" && ts.After(most_recent_swap) {
+				account_match := actorIsInAuth(action.Act.Authorizations, producer.Owner)
+
+				if account_match {
+
+					// setprice occurs most frequently
+					// check by timestamp within the last 2 hours
+					if action.Act.Name == "setprice" && action.Act.Account == "rem.oracle" && ts.After(two_hours_ago) {
+						found_setprice = true
+					}
+
+					// check if most recent swap happened after this bp was chosen
+					// and after our actions_cutoff duration
+					if most_recent_init.After(actions_cutoff) && most_recent_init.After(bp_chosen_time) {
+						// check if init action happened after most recent swap
+						if action.Act.Name == "init" && action.Act.Account == "rem.swap" && ts.After(most_recent_init) {
+							found_init = true
+						}
+					} else {
 						found_init = true
 					}
-				} else {
-					found_init = true
+
 				}
-
 			}
-		}
 
-		if !found_init {
-			missed_init.Producers = append(missed_init.Producers, producer)
-		}
+			if !found_init && init_exists {
+				missed_init.Producers = append(missed_init.Producers, producer)
+			}
 
-		if !found_setprice {
-			missed_setprice.Producers = append(missed_setprice.Producers, producer)
+			if !found_setprice && setprice_exists {
+				missed_setprice.Producers = append(missed_setprice.Producers, producer)
+			}
 		}
 	}
 
@@ -436,12 +456,13 @@ func sendAlerts(users []db.User) {
 						}
 
 						seconds_since_last := int(time.Since(last_block_time).Seconds())
+						minutes_since_last := int(seconds_since_last / 60)
 						missed_blocks := strconv.Itoa(int(seconds_since_last / 120))
 
 						if bp.LastBlockTime == "1970-01-01T00:00:00.000" {
 							block_message += `\n` + "*" + bp.Owner + "* has not produced any blocks yet."
 						} else {
-							block_message += `\n` + "*" + bp.Owner + "* produced " + strconv.Itoa(seconds_since_last) + " seconds ago (missed " + missed_blocks + " blocks)."
+							block_message += `\n` + "*" + bp.Owner + "* produced " + strconv.Itoa(minutes_since_last) + " minutes ago (missed " + missed_blocks + " blocks)."
 						}
 					}
 
@@ -451,7 +472,7 @@ func sendAlerts(users []db.User) {
 				// missed init
 				if has_missed_init {
 					init_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
-					init_message += `\n` + "The following block producers are missing `init` action, from last 12 hours:"
+					init_message += `\n` + "The following block producers are missing an `init` action, from last 12 hours:"
 
 					for _, bp := range filtered_missed_init.Producers {
 						init_message += `\n` + "*" + bp.Owner + "*"
@@ -463,7 +484,7 @@ func sendAlerts(users []db.User) {
 				// missed setprice
 				if has_missed_setprice {
 					setprice_message := "_" + time.Now().Format("Mon Jan _2 15:04 2006 UTC") + "_"
-					setprice_message += `\n` + "The following block producers are missing `setprice` action, from last 2 hours:"
+					setprice_message += `\n` + "The following block producers are missing a `setprice` action, from last 2 hours:"
 
 					for _, bp := range filtered_missed_setprice.Producers {
 						setprice_message += `\n` + "*" + bp.Owner + "*"
