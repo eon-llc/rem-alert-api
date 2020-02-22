@@ -303,6 +303,9 @@ func sendAlerts(users []db.User) {
 	a := getActions(actions_cutoff, action_names, limit, all_producers_s)
 	negative_two_hours := time.Hour * -2
 	two_hours_ago := today.Add(negative_two_hours)
+	// add a buffer of 10 minutes
+	// actions aren't precisely 1 hour apart
+	two_hours_ago = two_hours_ago.Add(time.Minute * -10)
 
 	// parse actions, if there are any
 	// to send out init and setprice alerts
