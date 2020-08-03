@@ -568,7 +568,7 @@ func getActions(epoch_ago time.Time, action_names string, limit string, account 
 		account = "act.authorization.actor=" + account + "&"
 	}
 
-	url := "https://rem.eon.llc/v2/history/get_actions?" + account + "act.name=" + action_names + "&limit=" + limit + "&sort=asc&after=" + after
+	url := "https://rem.eon.llc/v2/history/get_actions?action_ordinal=1&" + account + "act.name=" + action_names + "&limit=" + limit + "&sort=asc&after=" + after
 
 	request := gorequest.New()
 	_, body, errs := request.Get(url).End()
