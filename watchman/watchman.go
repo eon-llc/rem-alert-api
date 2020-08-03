@@ -643,12 +643,11 @@ func getVoters() voters {
 		log.Print(err)
 	}
 
-	// those who have never produced a block
-	// are of no concern, remove them
+	// remove anyone below stake requirement
 	for _, voter := range all.Voters {
 		staked, _ = strconv.ParseUint(string(voter.Staked), 10, 64)
 
-		if len(voter.Producers) > 0 && staked >= 2500000000 {
+		if staked >= 2500000000 {
 			active.Voters = append(active.Voters, voter)
 		}
 	}
